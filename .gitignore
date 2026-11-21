@@ -1,25 +1,9 @@
-# In your project root:
-cat << 'EOF' > .gitignore
-# Python artifacts
 __pycache__/
 *.py[cod]
-*$py.class
-.pytest_cache/
-
-# Streamlit & local caches
+.idea/
+.venv/
+.EPL_Sim/
 .streamlit/
 *.log
-
-# Virtual environments
-.venv/
-env/
-venv/
-.EPL_Sim/
-
-# PyCharm / IDE settings
-.idea/
-.vscode/
-
-# Sensitive data / keys
-.env
-EOF
+*.lp
+debug_runner.py

@@ -37,35 +37,43 @@ def get_genai_client(user_api_key: str = None):
     return genai.Client(api_key=api_key)
 
 
-def resolve_available_models(client) -> list:
+def resolve_available_models(client) -> tuple[list, list]:
     """Queries the API for models enabled on this key and orders preferred Flash models first."""
     preferred = [
+        "gemini-3.8-flash",
         "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.0-flash",
-        "gemini-2.0-flash",
     ]
+    raw_available = []
     try:
-        available = []
         for m in client.models.list():
             name = getattr(m, "name", "") or ""
             short_name = name.replace("models/", "")
             actions = getattr(m, "supported_actions", []) or []
             if "generateContent" in actions or not actions:
-                if "flash" in short_name and "image" not in short_name and "audio" not in short_name:
-                    available.append(short_name)
+                if (
+                    "gemini" in short_name
+                    and "image" not in short_name
+                    and "audio" not in short_name
+                    and "embedding" not in short_name
+                ):
+                    raw_available.append(short_name)
 
-        ordered = [m for m in preferred if m in available]
-        for m in available:
+        flash_models = [m for m in raw_available if "flash" in m]
+        ordered = [m for m in preferred if m in flash_models]
+        for m in flash_models:
             if m not in ordered:
                 ordered.append(m)
 
-        if ordered:
-            return ordered[:3]
+        # Always ensure gemini-3.8-flash and gemini-3.5-flash-lite are tried first
+        candidates = []
+        for m in ["gemini-3.8-flash", "gemini-3.5-flash-lite"] + ordered:
+            if m not in candidates:
+                candidates.append(m)
+        return candidates[:4], raw_available
     except Exception:
-        pass
-
-    return ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
+        return ["gemini-3.8-flash", "gemini-3.5-flash-lite"], raw_available
 
 
 def send_chat_resilient(
@@ -85,7 +93,7 @@ def send_chat_resilient(
         else None
     )
 
-    candidate_models = resolve_available_models(client)
+    candidate_models, raw_available = resolve_available_models(client)
     last_error = None
 
     for model_name in candidate_models:
@@ -117,7 +125,7 @@ def send_chat_resilient(
                 break
 
     raise RuntimeError(
-        f"All candidate models {candidate_models} failed. Last error: {last_error}"
+        f"Tried {candidate_models}. API ListModels returned: {raw_available}. Last error: {last_error}"
     )
 
 

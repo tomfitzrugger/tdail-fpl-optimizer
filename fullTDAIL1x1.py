@@ -17,33 +17,67 @@ st.set_page_config(page_title="FPL Master Tactical Suite", layout="wide")
 
 
 # ---------------------------------------------------------
-# 0. RESILIENT GENAI CLIENT & FAILOVER
+# 0. RESILIENT GENAI CLIENT & DYNAMIC MODEL DISCOVERY
 # ---------------------------------------------------------
-def get_genai_client():
-    """Instantiates a fresh client checking st.secrets first, then GEMINI_API_KEY env var."""
-    api_key = None
-    if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-    else:
-        api_key = os.environ.get("GEMINI_API_KEY")
+def get_genai_client(user_api_key: str = None):
+    """Instantiates a fresh client using the user's session key first, then env/secrets."""
+    api_key = (user_api_key or "").strip()
 
-    if api_key:
-        return genai.Client(api_key=api_key)
-    return genai.Client()
+    if not api_key:
+        if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        else:
+            api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        raise ValueError(
+            "No Gemini API key provided. Enter your key in the sidebar under 'Gemini API Key'."
+        )
+
+    return genai.Client(api_key=api_key)
+
+
+def resolve_available_models(client) -> list:
+    """Queries the API for models enabled on this key and orders preferred Flash models first."""
+    preferred = [
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.0-flash",
+        "gemini-2.0-flash",
+    ]
+    try:
+        available = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            short_name = name.replace("models/", "")
+            actions = getattr(m, "supported_actions", []) or []
+            if "generateContent" in actions or not actions:
+                if "flash" in short_name and "image" not in short_name and "audio" not in short_name:
+                    available.append(short_name)
+
+        ordered = [m for m in preferred if m in available]
+        for m in available:
+            if m not in ordered:
+                ordered.append(m)
+
+        if ordered:
+            return ordered[:3]
+    except Exception:
+        pass
+
+    return ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
 
 
 def send_chat_resilient(
     prompt_msg,
+    user_api_key=None,
     client=None,
-    primary_chat=None,
     system_instruction=None,
-    primary_model="gemini-2.5-flash",
-    fallback_model="gemini-2.5-flash-lite",
-    max_retries=3,
+    max_retries=2,
     initial_delay=2.0,
 ):
     if client is None:
-        client = get_genai_client()
+        client = get_genai_client(user_api_key)
 
     config = (
         types.GenerateContentConfig(system_instruction=system_instruction)
@@ -51,46 +85,40 @@ def send_chat_resilient(
         else None
     )
 
-    if primary_chat is None:
-        primary_chat = client.chats.create(model=primary_model, config=config)
+    candidate_models = resolve_available_models(client)
+    last_error = None
 
-    delay = initial_delay
-
-    # Phase 1: Try primary model with exponential backoff
-    for attempt in range(max_retries):
-        try:
-            return primary_chat.send_message(message=prompt_msg)
-        except RuntimeError as e:
-            if "client has been closed" in str(e):
-                client = get_genai_client()
-                primary_chat = client.chats.create(model=primary_model, config=config)
-                continue
-            raise e
-        except errors.ServerError as e:
-            if e.code == 503 and attempt < max_retries - 1:
-                time.sleep(delay)
-                delay *= 2.0
-            else:
+    for model_name in candidate_models:
+        delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                chat = client.chats.create(model=model_name, config=config)
+                return chat.send_message(message=prompt_msg)
+            except RuntimeError as e:
+                if "client has been closed" in str(e):
+                    client = get_genai_client(user_api_key)
+                    continue
+                last_error = e
                 break
-        except Exception as e:
-            if isinstance(e, errors.ClientError) and e.code in (400, 404):
+            except errors.ServerError as e:
+                last_error = e
+                if e.code == 503 and attempt < max_retries - 1:
+                    time.sleep(delay)
+                    delay *= 2.0
+                else:
+                    break
+            except errors.ClientError as e:
+                last_error = e
+                if e.code in (400, 404):
+                    break
+                raise e
+            except Exception as e:
+                last_error = e
                 break
-            raise e
 
-    # Phase 2: Fallback model
-    try:
-        if getattr(client, "_api_client", None) and getattr(
-            client._api_client, "_httpx_client", None
-        ):
-            if client._api_client._httpx_client.is_closed:
-                client = get_genai_client()
-
-        fallback_chat = client.chats.create(model=fallback_model, config=config)
-        return fallback_chat.send_message(message=prompt_msg)
-    except Exception as e:
-        raise RuntimeError(
-            f"Both {primary_model} and fallback {fallback_model} failed: {e}"
-        )
+    raise RuntimeError(
+        f"All candidate models {candidate_models} failed. Last error: {last_error}"
+    )
 
 
 # ---------------------------------------------------------
@@ -542,6 +570,17 @@ sb_col2.metric(
     f"-{potential_hit_cost} pts" if potential_hit_cost > 0 else "0 pts",
 )
 
+# Sidebar: Per-User Gemini API Key Input
+with st.sidebar.expander("🔑 Gemini API Key (For AI Advisor)", expanded=False):
+    user_gemini_key = st.text_input(
+        "Your Gemini API Key",
+        type="password",
+        key="user_gemini_key",
+        placeholder="AIzaSy...",
+        help="Optional if a host key is configured; otherwise paste your free Google AI Studio key.",
+    )
+    st.caption("[Get a free API key at Google AI Studio](https://aistudio.google.com/apikey)")
+
 # Sidebar: Advanced Model Weights Expander
 with st.sidebar.expander("⚙️ Advanced Model Weights", expanded=False):
     decay_rate = st.slider(
@@ -804,7 +843,7 @@ with tab_opt:
 # TAB 2: GEMINI TACTICAL ADVISOR
 # ---------------------------------------------------------
 with tab_advisor:
-    st.subheader("🤖 TDAIL++ Tactical Managerial Briefing (Gemini 2.5 Flash)")
+    st.subheader("🤖 TDAIL++ Tactical Managerial Briefing (Gemini Flash)")
 
     if "fpl_plan" not in st.session_state:
         st.info(
@@ -865,9 +904,8 @@ with tab_advisor:
                     )
                     response = send_chat_resilient(
                         prompt_msg=prompt_msg,
+                        user_api_key=user_gemini_key,
                         system_instruction=system_instruction,
-                        primary_model="gemini-2.5-flash",
-                        fallback_model="gemini-2.5-flash-lite",
                     )
 
                     st.markdown("---")
